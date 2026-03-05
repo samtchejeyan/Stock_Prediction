@@ -48,7 +48,7 @@ warnings.filterwarnings('ignore')
 # In[2]:
 
 
-pip install scipy==1.15.1
+
 
 
 # In[3]:
