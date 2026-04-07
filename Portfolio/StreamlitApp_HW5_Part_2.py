@@ -57,8 +57,8 @@ MODEL_INFO = {
         "endpoint": aws_endpoint,
         "explainer": 'explainer_pca.shap', 
         "pipeline": 'finalized_pca_model.tar.gz', 
-        "keys": ["kernelpca8","kernelpca6"], 
-        "inputs": [{"name": k, "type": "number", "min": -100.0, "max": 100.0, "default": 0.0, "step": 10.0} for k in ["kernelpca8","kernalpca6"]] 
+        "keys": ["EMA_10","ROC_10"], 
+        "inputs": [{"name": k, "type": "number", "min": -100.0, "max": 100.0, "default": 0.0, "step": 10.0} for k in ["EMA_10","ROC_10"]] 
 }
 
 def load_pipeline(_session, bucket, key):
