@@ -1,4 +1,4 @@
-import os, sys, warnings
+eimport os, sys, warnings
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -57,7 +57,7 @@ MODEL_INFO = {
         "endpoint": aws_endpoint,
         "explainer": 'explainer_pca.shap', 
         "pipeline": 'finalized_pca_model.tar.gz', 
-        "keys": ["RSI_15","MOM_15"], 
+        "keys": ["kernelpca8","kernelpca6"], 
         "inputs": [{"name": k, "type": "number", "min": -100.0, "max": 100.0, "default": 0.0, "step": 10.0} for k in ["RSI_15","MOM_15"]] 
 }
 
@@ -116,7 +116,7 @@ def display_explanation(input_df, session, aws_bucket):
 
     best_pipeline = load_pipeline(session, aws_bucket, 'sklearn-pipeline-deployment')
     
-    preprocessing_pipeline = Pipeline(steps=best_pipeline.steps[0:2]) 
+    preprocessing_pipeline = Pipeline(steps=best_pipeline.steps[0:3]) 
     input_df_transformed = preprocessing_pipeline.transform(input_df) 
     feature_names = best_pipeline[0:2].get_feature_names_out() 
     input_df_transformed = pd.DataFrame(input_df_transformed, columns=feature_names) 
