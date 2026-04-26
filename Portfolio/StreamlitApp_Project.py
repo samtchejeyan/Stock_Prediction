@@ -1,6 +1,4 @@
-import os
-import sys
-import warnings
+import os, sys, warnings
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -11,30 +9,47 @@ import joblib
 import tarfile
 import tempfile
 
+from joblib import dump, load
+
 import boto3
 import sagemaker
 from sagemaker.predictor import Predictor
-from sagemaker.serializers import NumpySerializer
+from sagemaker.serializers import JSONSerializer
 from sagemaker.deserializers import NumpyDeserializer
 
-# Setup & Path Configuration
+from imblearn.pipeline import Pipeline as ImbPipeline
+import shap
+
+# ── Setup ─────────────────────────────────────────────────────────────────────
 warnings.simplefilter("ignore")
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
+current_dir  = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, '..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from src.feature_utils import extract_features_loan
+# Load saved X_train - try multiple possible paths for Streamlit Cloud vs local
+for candidate in [
+    os.path.join(current_dir, 'X_train.csv'),
+    os.path.join(project_root, 'Portfolio/X_train.csv'),
+    os.path.join(current_dir, 'Portfolio/X_train.csv'),
+    'X_train.csv'
+]:
+    if os.path.exists(candidate):
+        file_path = candidate
+        break
 
-# Access the secrets
+dataset = pd.read_csv(file_path)
+dataset = dataset.loc[:, ~dataset.columns.str.contains('^Unnamed')]
+
+# ── AWS Secrets ───────────────────────────────────────────────────────────────
 aws_id       = st.secrets["aws_credentials"]["AWS_ACCESS_KEY_ID"]
 aws_secret   = st.secrets["aws_credentials"]["AWS_SECRET_ACCESS_KEY"]
 aws_token    = st.secrets["aws_credentials"]["AWS_SESSION_TOKEN"]
 aws_bucket   = st.secrets["aws_credentials"]["AWS_BUCKET"]
 aws_endpoint = st.secrets["aws_credentials"]["AWS_ENDPOINT"]
 
-# AWS Session Management
+# ── AWS Session ───────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_session(aws_id, aws_secret, aws_token):
     return boto3.Session(
@@ -47,144 +62,189 @@ def get_session(aws_id, aws_secret, aws_token):
 session    = get_session(aws_id, aws_secret, aws_token)
 sm_session = sagemaker.Session(boto_session=session)
 
-# Data & Model Configuration
-df_features = extract_features_loan()
-
+# ── Model Configuration ───────────────────────────────────────────────────────
+# Top 5 features from SHAP waterfall plot (int_rate and grade are strongest drivers)
 MODEL_INFO = {
-    "endpoint": aws_endpoint,
-    "pipeline": "finalized_loan_model.tar.gz",
-    "keys": [
-        "loan_amnt", "term", "int_rate", "installment",
-        "grade", "emp_length", "home_ownership", "annual_inc", "purpose"
-    ],
-    "inputs": [
-        {"name": "loan_amnt",   "label": "Loan Amount ($)",         "min": 500.0,   "max": 40000.0,  "default": 10000.0, "step": 500.0},
-        {"name": "int_rate",    "label": "Interest Rate (%)",        "min": 5.0,     "max": 30.0,     "default": 13.0,    "step": 0.5},
-        {"name": "installment", "label": "Monthly Installment ($)",  "min": 50.0,    "max": 1500.0,   "default": 300.0,   "step": 10.0},
-        {"name": "annual_inc",  "label": "Annual Income ($)",        "min": 10000.0, "max": 500000.0, "default": 60000.0, "step": 1000.0},
-    ],
-    "selects": [
-        {"name": "term",           "label": "Loan Term (months)",        "options": [36, 60],
-         "default": 36},
-        {"name": "grade",          "label": "Loan Grade",                "options": ["A","B","C","D","E","F","G"],
-         "default": "B"},
-        {"name": "home_ownership", "label": "Home Ownership",            "options": ["MORTGAGE","OWN","RENT","OTHER"],
-         "default": "MORTGAGE"},
-        {"name": "emp_length",     "label": "Employment Length (years)", "options": [
-             "< 1 year","1 year","2 years","3 years","4 years",
-             "5 years","6 years","7 years","8 years","9 years","10+ years"],
-         "default": "5 years"},
-        {"name": "purpose",        "label": "Loan Purpose",              "options": [
-             "debt_consolidation","credit_card","home_improvement","other",
-             "major_purchase","medical","small_business","car",
-             "vacation","moving","house","educational"],
-         "default": "debt_consolidation"},
+    "endpoint"  : aws_endpoint,
+    "explainer" : "explainer_loan.shap",
+    "pipeline"  : "finalized_loan_model.tar.gz",
+    "keys"      : ['int_rate', 'grade', 'annual_inc', 'installment', 'home_ownership'],
+    "inputs"    : [
+        {
+            "name"    : "int_rate",
+            "label"   : "Interest Rate (%)",
+            "min"     : 5.0,
+            "max"     : 30.0,
+            "default" : 13.0,
+            "step"    : 0.1,
+            "help"    : "The loan interest rate assigned to the borrower."
+        },
+        {
+            "name"    : "grade",
+            "label"   : "Loan Grade  (0 = A  …  6 = G)",
+            "min"     : 0.0,
+            "max"     : 6.0,
+            "default" : 2.0,
+            "step"    : 1.0,
+            "help"    : "LendingClub credit grade. A (0) is lowest risk, G (6) is highest."
+        },
+        {
+            "name"    : "annual_inc",
+            "label"   : "Annual Income — log scale  (e.g. 11 ≈ $60k)",
+            "min"     : 8.0,
+            "max"     : 14.0,
+            "default" : 11.0,
+            "step"    : 0.1,
+            "help"    : "log1p(annual income). 11 ≈ $60k, 12 ≈ $162k, 10 ≈ $22k."
+        },
+        {
+            "name"    : "installment",
+            "label"   : "Monthly Installment ($)",
+            "min"     : 30.0,
+            "max"     : 1500.0,
+            "default" : 300.0,
+            "step"    : 10.0,
+            "help"    : "Fixed monthly payment amount for the loan."
+        },
+        {
+            "name"    : "home_ownership",
+            "label"   : "Home Ownership  (0=ANY  1=MORTGAGE  2=NONE  3=OTHER  4=OWN  5=RENT)",
+            "min"     : 0.0,
+            "max"     : 5.0,
+            "default" : 1.0,
+            "step"    : 1.0,
+            "help"    : "Borrower's home ownership status (label encoded)."
+        },
     ]
 }
 
-# Encoding maps — must match label encoding used during training
-GRADE_MAP     = {g: i for i, g in enumerate(sorted(["A","B","C","D","E","F","G"]))}
-OWNERSHIP_MAP = {o: i for i, o in enumerate(sorted(["MORTGAGE","OTHER","OWN","RENT"]))}
-PURPOSE_MAP   = {p: i for i, p in enumerate(sorted([
-    "car","credit_card","debt_consolidation","educational",
-    "home_improvement","house","major_purchase","medical",
-    "moving","other","small_business","vacation"
-]))}
-EMP_MAP = {
-    "< 1 year": 0, "1 year": 1, "2 years": 2,  "3 years": 3,
-    "4 years":  4, "5 years": 5, "6 years": 6,  "7 years": 7,
-    "8 years":  8, "9 years": 9, "10+ years": 10
-}
+# ── Load Pipeline from S3 ─────────────────────────────────────────────────────
+def load_pipeline(_session, bucket, key):
+    s3_client = _session.client('s3')
+    filename  = MODEL_INFO["pipeline"]
 
+    s3_client.download_file(
+        Filename=filename,
+        Bucket=bucket,
+        Key=f"{key}/{os.path.basename(filename)}"
+    )
 
-# Prediction Logic
+    with tarfile.open(filename, "r:gz") as tar:
+        tar.extractall(path=".")
+        joblib_file = [f for f in tar.getnames() if f.endswith('.joblib')][0]
+
+    return joblib.load(joblib_file)
+
+# ── Load SHAP Explainer from S3 ───────────────────────────────────────────────
+def load_shap_explainer(_session, bucket, key, local_path):
+    s3_client = _session.client('s3')
+
+    if not os.path.exists(local_path):
+        s3_client.download_file(Filename=local_path, Bucket=bucket, Key=key)
+
+    with open(local_path, "rb") as f:
+        return load(f)
+
+# ── Prediction via SageMaker Endpoint ────────────────────────────────────────
 def call_model_api(input_df):
     predictor = Predictor(
         endpoint_name=MODEL_INFO["endpoint"],
         sagemaker_session=sm_session,
-        serializer=NumpySerializer(),
+        serializer=JSONSerializer(),
         deserializer=NumpyDeserializer()
     )
 
     try:
-        raw_pred = predictor.predict(input_df.values.astype(float))
-        pred_val = int(pd.DataFrame(raw_pred).values[-1][0])
-        mapping  = {0: "✅ Fully Paid", 1: "⚠️ Charged Off (Default)"}
-        return mapping.get(pred_val, str(pred_val)), pred_val, 200
+        raw_pred = predictor.predict(input_df)
+        pred_val = pd.DataFrame(raw_pred).values[-1][0]
+        mapping  = {0: "✅ Fully Paid", 1: "⚠️ Likely Default"}
+        return mapping.get(int(pred_val), str(pred_val)), 200
     except Exception as e:
-        return f"Error: {str(e)}", None, 500
+        return f"Error: {str(e)}", 500
 
+# ── SHAP Waterfall Plot ───────────────────────────────────────────────────────
+def display_explanation(input_df, session, aws_bucket):
+    explainer_name = MODEL_INFO["explainer"]
+    local_path     = os.path.join(tempfile.gettempdir(), explainer_name)
 
-# Streamlit UI
+    explainer     = load_shap_explainer(
+        session, aws_bucket,
+        posixpath.join('explainer', explainer_name),
+        local_path
+    )
+    best_pipeline = load_pipeline(session, aws_bucket, 'sklearn-pipeline-deployment')
+
+    # Run preprocessing steps only (exclude model = last step)
+    preprocessing_pipeline = ImbPipeline(steps=best_pipeline.steps[:-1])
+
+    input_df_transformed = preprocessing_pipeline.transform(pd.DataFrame(input_df))
+    feature_names        = best_pipeline[:-1].get_feature_names_out()
+    input_df_transformed = pd.DataFrame(input_df_transformed, columns=feature_names)
+
+    shap_values = explainer(input_df_transformed, check_additivity=False)
+
+    st.subheader("🔍 Decision Transparency (SHAP)")
+    fig, ax = plt.subplots(figsize=(10, 4))
+    shap.plots.waterfall(shap_values[0, :, 1], show=False)  # class 1 = default
+    st.pyplot(fig)
+
+    top_feature = (
+        pd.Series(shap_values[0, :, 1].values, index=shap_values[0, :, 1].feature_names)
+        .abs()
+        .idxmax()
+    )
+    st.info(f"**Key Driver:** The most influential factor in this prediction was **{top_feature}**.")
+
+# ── Streamlit UI ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Loan Default Predictor", layout="wide")
 st.title("🏦 Loan Default Predictor")
 st.markdown(
-    "Enter borrower details below to predict whether a loan is likely to be "
-    "**fully paid** or **charged off (defaulted)**."
+    "Enter key loan and borrower details below. "
+    "The model will predict the likelihood of default and explain the key drivers of that decision."
 )
 
 with st.form("pred_form"):
-    st.subheader("Loan & Borrower Inputs")
+    st.subheader("Loan Application Inputs")
     cols = st.columns(2)
-
     user_inputs = {}
 
-    # Number inputs
     for i, inp in enumerate(MODEL_INFO["inputs"]):
         with cols[i % 2]:
-            user_inputs[inp["name"]] = st.number_input(
-                inp["label"],
-                min_value=inp["min"],
-                max_value=inp["max"],
-                value=float(inp["default"]),
-                step=inp["step"]
+            user_inputs[inp['name']] = st.number_input(
+                inp['label'],
+                min_value=float(inp['min']),
+                max_value=float(inp['max']),
+                value=float(inp['default']),
+                step=float(inp['step']),
+                help=inp['help']
             )
 
-    # Select inputs
-    for i, sel in enumerate(MODEL_INFO["selects"]):
-        with cols[1]:
-            user_inputs[sel["name"]] = st.selectbox(
-                sel["label"],
-                options=sel["options"],
-                index=sel["options"].index(sel["default"])
-            )
+    submitted = st.form_submit_button("🔍 Run Prediction")
 
-    submitted = st.form_submit_button("Run Prediction")
+# Fill remaining columns from saved X_train row 0
+original = dataset.iloc[0:1].to_dict(orient='records')[0]
+original.update(user_inputs)
+input_df = pd.DataFrame([original])
 
 if submitted:
-
-    # Encode categorical inputs to match training label encoding
-    encoded = {
-        "loan_amnt":      user_inputs["loan_amnt"],
-        "term":           float(user_inputs["term"]),
-        "int_rate":       user_inputs["int_rate"],
-        "installment":    user_inputs["installment"],
-        "grade":          GRADE_MAP[user_inputs["grade"]],
-        "emp_length":     EMP_MAP[user_inputs["emp_length"]],
-        "home_ownership": OWNERSHIP_MAP[user_inputs["home_ownership"]],
-        "annual_inc":     np.log1p(user_inputs["annual_inc"]),
-        "purpose":        PURPOSE_MAP[user_inputs["purpose"]],
-    }
-
-    input_df = pd.DataFrame([encoded], columns=MODEL_INFO["keys"])
-
-    result, pred_val, status = call_model_api(input_df)
+    with st.spinner("Running prediction..."):
+        res, status = call_model_api(input_df)
 
     if status == 200:
-        st.divider()
-        st.subheader("Prediction Result")
-        st.metric("Outcome", result)
+        st.metric("Prediction Result", res)
 
-        if pred_val == 1:
-            st.error(
-                "**Business Insight:** This borrower is predicted to **default**. "
-                "Lenders should consider adjusting the interest rate, reducing the loan amount, "
-                "or requiring additional collateral before approving this application."
+        if "Default" in res:
+            st.warning(
+                "⚠️ This applicant is flagged as **high-risk**. "
+                "Consider manual review, adjusted interest rates, or reduced loan amount."
             )
         else:
             st.success(
-                "**Business Insight:** This borrower is predicted to **fully repay** the loan. "
-                "Based on the provided inputs, the model identifies this as a low-risk application."
+                "✅ This applicant is predicted to **fully repay** the loan. "
+                "Standard approval process may proceed."
             )
+
+        with st.spinner("Generating SHAP explanation..."):
+            display_explanation(input_df, session, aws_bucket)
     else:
-        st.error(result)
+        st.error(res)
